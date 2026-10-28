@@ -69,6 +69,38 @@ class TestProjectTaskStock(TestProjectStockBase):
         if "project_id" in self.task.stock_analytic_line_ids._fields:
             self.assertFalse(self.task.stock_analytic_line_ids.project_id)
 
+    @mute_logger("odoo.models.unlink")
+    def test_project_task_picked_flow(self):
+        self.move_product_b.unlink()
+        self.task.action_assign()
+        self.assertEqual(self.move_product_a.state, "assigned")
+        self.assertFalse(self.move_product_a.picked)
+        self.move_product_a.product_uom_qty = 4
+        self.task.action_assign()
+        self.assertEqual(self.move_product_a.state, "partially_available")
+        self.assertFalse(self.move_product_a.picked)
+        self.task.action_done()
+        self.assertEqual(self.move_product_a.state, "partially_available")
+        self.assertTrue(self.move_product_a.picked)
+        # new line
+        task_form = Form(self.task)
+        with task_form.move_ids.new() as move_form:
+            move_form.product_id = self.product_b
+            move_form.product_uom_qty = 1
+        task_form.save()
+        move_product_b = self.task.move_ids - self.move_product_a
+        self.move_product_a.product_uom_qty = 2
+        self.task.action_assign()
+        self.assertEqual(self.move_product_a.state, "assigned")
+        self.assertTrue(self.move_product_a.picked)
+        self.assertEqual(move_product_b.state, "assigned")
+        self.assertFalse(move_product_b.picked)
+        self.task.action_done()
+        self.assertEqual(self.move_product_a.state, "done")
+        self.assertTrue(self.move_product_a.picked)
+        self.assertEqual(move_product_b.state, "done")
+        self.assertTrue(move_product_b.picked)
+
     def test_project_task_without_analytic_account(self):
         self.task = self.env["project.task"].browse(self.task.id)
         # Prevent error when hr_timesheet addon is installed.
@@ -145,6 +177,45 @@ class TestProjectTaskStock(TestProjectStockBase):
         self._test_task_analytic_lines_from_task(-40)
         self.assertEqual(
             fields.first(self.task.stock_analytic_line_ids).date, fields.date.today()
+        )
+
+    def test_project_task_analytic_lines_with_returned_picking(self):
+        # Create initial moves
+        self.task = self.env["project.task"].browse(self.task.id)
+        self.task.action_assign()
+        picking = self.task.move_ids.picking_id
+        for move in picking.move_ids:
+            move.quantity = move.product_uom_qty
+        picking.button_validate()
+        self.assertEqual(picking.state, "done")
+        # Return the initial moves
+        stock_return_picking_form = Form(
+            self.env["stock.return.picking"].with_context(
+                active_ids=picking.ids,
+                active_id=picking.id,
+                active_model="stock.picking",
+            )
+        )
+        stock_return_picking = stock_return_picking_form.save()
+        for return_line in stock_return_picking.product_return_moves:
+            return_line.quantity = return_line.move_id.product_uom_qty
+        stock_return_picking_action = stock_return_picking.action_create_returns()
+        return_pick = self.env["stock.picking"].browse(
+            stock_return_picking_action["res_id"]
+        )
+        return_pick.action_assign()
+        for return_line in return_pick.move_ids:
+            return_line.quantity = return_line.origin_returned_move_id.quantity
+        return_pick.button_validate()
+        self.assertEqual(return_pick.state, "done")
+        # Check that the resulting analytic lines sum is 0
+        stock_analytic_lines = self.task.sudo().stock_analytic_line_ids
+        self.assertEqual(len(stock_analytic_lines), 4)
+        self.assertEqual(sum(stock_analytic_lines.mapped("unit_amount")), 0)
+        self.assertEqual(sum(stock_analytic_lines.mapped("amount")), 0)
+        self.assertIn(
+            self.analytic_account,
+            stock_analytic_lines.mapped("account_id"),
         )
 
     @users("manager-user")
